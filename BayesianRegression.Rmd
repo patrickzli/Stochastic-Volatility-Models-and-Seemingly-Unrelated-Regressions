@@ -1,0 +1,363 @@
+---
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+require(MCMCpack)
+require(mvtnorm)
+require(invgamma)
+require(bayesm)
+require('stat440-utils.R')
+solveV <- function(V, x, ldV = FALSE) {
+  C <- chol(V) # cholesky decomposition
+  if(missing(x)) x <- diag(nrow(V))
+  # solve is O(ncol(C) * ncol(x)) with triangular matrices
+  # using backward subsitution
+  ans <- backsolve(r = C, x = backsolve(r = C, x = x, transpose = TRUE))
+  if(ldV) {
+    ldV <- 2 * sum(log(diag(C)))
+    ans <- list(y = ans, ldV = ldV)
+  }
+  ans
+}
+
+
+SUR_DMC.post <- function(T, N, P, nSample, X, Y, beta0 = NULL,update_beta = TRUE, update_rho = TRUE, print_likelihood = FALSE){
+  # Initialize lists to store covariance matrices and beta vectors
+  output_beta <- list()
+  output_rho <- list()
+  # Check to see if an initialization of beta is provided
+  if (is.null(beta0)) {
+    # If no initialization is provided, initialize all betas to 0
+    beta0 <- matrix(rep(0,N*P),ncol=P)
+  }
+  betas <- beta0
+  # Fit each of N SUR equations, and take the residuals from the resulting matrix
+  # Use of an sapply to vectorize the operation for mild speed up
+  epsilon <- sapply(1:N,function(ii) lm(Y~.-1, data=data.frame(Y=Y[,ii],X[,((1+(ii-1))*P)]))$residuals)
+  # Initialize rho based on starting fit
+  rho <- crossprod(epsilon)/T + 0.001*diag(N)
+  # Initialize a vector of errors, which we use to append to X_i matrices to create
+  # The necessary Z_i matrices
+  u <- matrix(rep(0,T*N), ncol=T)
+  # Start drawing each of the nSample beta and covariance samples
+  for(ii in 1:(nSample)) {
+    # Set loglikelihood of sample to 0
+    loglik <-0
+    # Sequentially sample values for each of the N equations
+    for(jj in 1:N){
+      # Subset the necessary X_j and Y_j vectors
+      Xj <- X[,((jj-1)*P+1):(jj*P)]
+      Yj <- Y[,jj]
+      # Calculate the error term using current beta fit
+      r <-  Yj - Xj%*%betas[jj,]
+      # Draw a rho sample from the inverse gamma distribution
+      if (update_rho == TRUE){
+        rho[jj,jj] <- rinvgamma(1,shape = 0.5*(T-P-jj+1), scale = 0.5*(crossprod(r)))
+      }
+      # If statements due to slight R nuance to handle appending vectors/matrices properly
+      # Append necessary columns of u to Xj depending on the situation
+      if (jj == 1){
+        Zj = Xj
+      } else if (jj == 2){
+        Zj <- cbind(Xj, u[1,])
+      } else{
+        Zj <- cbind(Xj, t(u[1:(jj-1),]))
+      }
+      ZZinv <- solveV(crossprod(Zj))
+      # Update value of bhat
+      bhat <- ZZinv%*%t(Zj)%*%Yj
+      # Draw a sample of b from the multivariate normal distribution
+      b <- rmvnorm(1,bhat, rho[jj,jj]^2*ZZinv)
+      # Update beta values if flag set to TRUE
+      if (update_beta == TRUE){
+        betas[jj,] <- b[1:p]
+      }
+      # Update the error terms in u matrix
+      u[jj,] <- Yj - Xj%*%betas[jj,]
+      # Update values of rho if flag set to TRUE
+      if (update_rho == TRUE){
+        if (jj > 1){
+          rho[jj,(1:(jj-1))] <- b[(p+1):length(b)] 
+          rho[(1:(jj-1)),jj] <- b[(p+1):length(b)]
+        }
+      }
+      # Update loglik value only if flag is set to true
+      if (print_likelihood == TRUE){
+        # Add the loglikelihood from the mth equation to the total loglikelihood
+        loglik <- loglik + SUR_DMC.loglik(b,rho[jj,jj],Yj,Zj,T,N)
+      }
+    }
+    if (print_likelihood == TRUE && ii%%100 == 0){
+      print(loglik)
+    }
+    # Append beta draws to list
+    output_beta[[ii]] <- betas
+    # Append rho draws to list
+    output_rho[[ii]] <- rho
+  }
+  output <- list(beta = output_beta, rho = output_rho)
+  return(output)
+}
+```
+
+### Test the DMC Sampler
+#Test to see if the numerical simplification of the posterior is accurate
+```{r carst}
+# check that marginal + conditional = joint systems with one equation
+nreps <- 10
+n <- 10
+p <- 2
+m <- 1
+Z <- matrix(runif(n*p),nrow=n)
+y <- runif(n)
+Sigma <- riwish(n,diag(m))
+lp <- replicate(nreps, expr = {
+  beta <- rnorm(p)
+  # unsimplified
+  lpu <- log(sqrt(Sigma))^(-n-1)- crossprod(y-Z%*%beta)/(2*Sigma)
+  # simplified conditional beta
+  M <- solveV(t(Z)%*%Z)
+  bhat <- M%*%t(Z)%*%y
+  lpc <- log(dmvnorm(beta,M%*%t(Z)%*%y, Sigma[1,1]*M))
+  # marginal for sigma
+  lpm <- log(dinvgamma(Sigma, 0.5*crossprod(y-Z%*%bhat),0.5*(n-p)))
+  lpu-lpc-lpm
+})
+lp
+```
+We see that all the differences between unsimplified and simplified posteriors is identical. 
+
+Test if the simplified posterior is correct for $\beta_i$ for i > 1
+```{r as}
+nreps <- 10
+n <- 10
+p <- 2
+m <- 2
+Z1 <- matrix(runif(n*p),nrow=n)
+y1 <- runif(n)
+X2 <- matrix(runif(n*p),nrow=n)
+y2 <- runif(n)
+beta1 <- rnorm(p)
+Sigma <- riwish(n,diag(m))
+lp <- replicate(nreps, expr = {
+  # Calculate the error of our estimates
+  u1 <- y1-Z1%*%beta1
+  # Store error as a predictor variate in a new matrix Z2
+  Z2 <- cbind(X2,u1)
+  # Generate a random beta2 vector
+  beta2 <- rnorm(p+1)
+  # unsimplified
+  lpu1 <- log(sqrt(Sigma[1,1]))^(-n-1)- crossprod(y1-Z1%*%beta1)/(2*Sigma[1,1])
+  # simplified conditional beta
+  M <- solveV(t(Z1)%*%Z1)
+  bhat1 <- M%*%t(Z1)%*%y1
+  lpc1 <- log(dmvnorm(beta1,bhat1, Sigma[1,1]*M))
+  # marginal for sigma
+  lpm1 <- log(dinvgamma(Sigma[1,1], 0.5*crossprod(y1-Z1%*%bhat1),0.5*(n-p)))
+  
+  lpu2 <- log(sqrt(Sigma[2,2]))^(-n-1)- crossprod(y2-Z2%*%beta2)/(2*Sigma[2,2])
+  
+  M <- solveV(t(Z2)%*%Z2)
+  bhat2 <- M%*%t(Z2)%*%y2
+  lpc2 <- log(dmvnorm(beta2,bhat2, Sigma[2,2]*M))
+  lpm2 <- log(dinvgamma(Sigma[2,2], 0.5*crossprod(y2-Z2%*%bhat2),0.5*(n-p-1)))
+  
+  # Add up unsimplified log probabilities of each beta vector
+  lpu <- lpu1 + lpu2
+  # Add up conditional log probabilities of each beta vector
+  lpc <- lpc1 + lpc2
+  # Add up marginal log probabilities of each beta vector
+  lpm <- lpm1 + lpm2
+  
+  # Compute the difference between beta vectors
+  lpu-lpc-lpm
+})
+lp
+```
+We see that all the differences between unsimplified and simplified posteriors is identical. 
+
+
+# Integration test to see if draws are from desired distribution
+```{r asfa}
+nSample = 1000
+T <- 100
+N <- 1
+P <- 2
+X <- matrix(runif(N*T*P),nrow=T)
+Y <- matrix(rnorm(N*T),nrow=T)
+beta = matrix(rnorm(N*P),ncol=P)
+M <- solveV(crossprod(X[,1:P]))
+bhat1 <- M%*%t(X[,1:P])%*%Y[,1]
+# Run the DMC without updating rho once, and once without updating beta to see distribution of other param
+beta_samples <- SUR_DMC.post(T,N,P,nSample,X,Y,beta,update_beta = TRUE,update_rho=FALSE)
+rho_samples <- SUR_DMC.post(T,N,P,nSample,X,Y,beta,update_beta = FALSE,update_rho=TRUE)
+```
+
+Draw histogram for $\beta$ draws
+```{r s}
+# Set constant rho1
+rho1 <- beta_samples$rho[[1]][1]
+# Compute normal draws needed to draw a density curve
+norm_samples <- rnorm(10000,mean=bhat1[1],sd=rho1*sqrt(M[1,1]))
+# Draw histogram
+hist(sapply(1:nSample, function (ii) beta_samples$beta[[ii]][1]),breaks=30,probability = TRUE,
+     main = expression(paste("Draws of ", beta, "1 against the corresponding density curve")),
+     xlab = expression(paste(beta,"1")))
+lines(density(norm_samples),col='red',lwd=2)
+```
+We see that the fit is reasonable, indicating that we can assume, with some confidence, that we are drawing from the correct posterior for $\beta$ terms.
+
+Draw histogram for $\sigma$ draws
+```{r asfsafasdf}
+# Compute the necessary inverse gamma parameters for sigma draws
+r <- Y[,1]-X[,1:2]%*%beta[1,]
+shape <- 0.5*(T-P)
+scale <- 0.5*crossprod(r)
+# Sample from an inversegamma distribution to draw density curve
+rinvgam <- rinvgamma(10000,shape=shape,scale=scale)
+# Draw histogram
+hist(sapply(1:nSample, function (ii) rho_samples$rho[[ii]][1]),breaks=30,probability = TRUE,
+     main = expression(paste("Draws of ", sigma, "1 against the corresponding density curve")),
+     xlab = expression(paste(sigma,"1")))
+lines(density(rinvgam),col='red',lwd=2)
+```
+We see that the fit is reasonable, indicating that we can assume, with some confidence, that we are drawing from the correct posterior for $\sigma$ terms.
+
+### Test MCMC sampler from bayesm package using our own implementation of the RsurGibbs function.
+ Our own implementation is necessary since $\beta$ is always conditional on $\Omega$, and vice versa. We needed an implementation of the function to hold each parameter constant to perform the necessary integration tests. We will graph the histograms of $\beta$ and $\Omega$ against their theoretical condtional density curves. We then compare the outputs of bayesm and our implementation under the same dataset to see if we can be reasonable confident that the samplers are implemented in the same way.
+```{r cars}
+# Initialize data
+d <- readRDS("Processed_Data.rds")
+X <- d$X
+Y <- d$Y
+
+# Naive implementation of a sampler to test the bayesm Gibbs sampler
+# NOTE: This function does not aim to be efficient, just used to test
+# Formats for X and Y are kept consistent with our other SUR functions
+# New structures for X and Y are created in the function for computational convenience
+SUR_Bayes.post <- function(T, P, N, niter, X, Y,update_omega=TRUE,update_beta=TRUE){
+  # Initialize a vector and list for sample outputs of beta and omega
+  output_beta <- NULL
+  output_omega <- list()
+  # Initialize matrices for storage
+  sparseX <- matrix(rep(0,P*T*N^2),ncol=P*N)
+  longY <- c()
+  # Initialize a matrix to ensure InvWishart parameters are positive definite
+  # in case of rounding issues
+  A0 = 0.001*diag(N)
+  
+  # Store observations in expanded matrices
+  for (ii in 1:N){
+    cols <- (1+(ii-1)*P):(ii*P)
+    obs <- (1+(ii-1)*T):(ii*T)
+    params <- (1+(ii-1)*P):(ii*P)
+    sparseX[obs, params] <- X[,cols]
+    longY <- c(longY, Y[,ii])
+  }
+  
+  X_list <- list()
+  y_list <- list()
+  for(ii in 1:N){
+    cols <- (1+(ii-1)*P):(ii*P)
+    X_list[[ii]] <- X[1:T,cols]
+    y_list[[ii]] <- Y[1:T,ii]
+  }
+  # Initialize omega using OLS estimates for faster convergence
+  epsilon <- sapply(1:N,function(x) lm(Y~.-1, data=data.frame(Y=y_list[[x]],X_list[[x]]))$residuals)
+  omega= crossprod(epsilon)/T+0.01*diag(N)
+  beta <- rep(0,P*N)
+  for(ii in 1:(niter)) {
+    # One interation of conditional updates
+    invomega <- solveV(omega)
+    M <- kronecker(solveV(omega),diag(T))
+    bhat <- solveV(t(sparseX)%*%M%*%sparseX)%*%t(sparseX)%*%M%*%longY
+    omegahat <- solveV(t(sparseX)%*%M%*%sparseX)
+    if (update_beta == TRUE){
+      beta <- mvrnorm(mu=bhat,Sigma=omegahat) 
+    }
+    u <- longY-sparseX%*%beta
+    R <- sapply(1:N, function(x) 
+      sapply(1:N, function(y) 
+        t(y_list[[x]] - X_list[[x]]%*%beta[(1+(P*(x-1))):(x*P)])%*%(y_list[[y]] - X_list[[y]]%*%beta[(1+(P*(y-1))):(y*P)])))
+    if (update_omega == TRUE){
+      omega <- riwish(T,R+A0)
+    }
+    output_beta <- rbind(output_beta, beta)
+    output_omega[[ii]] <- omega
+  }
+  output <- list(beta = output_beta, omega = output_omega)
+  return(output)
+}
+```
+
+# Initialize necessary dataframes for tests
+```{r asdfsadffadsfdf}
+# Create lists of data needed to run test on Sigma draws
+# regdata_test will later be used for a direct comparison against the bayesm sampler
+regdata_test <- list()
+X_listtest <- list()
+y_listtest <- list()
+T <- 25
+N <- 2
+P <- 2
+for(ii in 1:N){
+  cols <- (1+(ii-1)*P):(ii*P)
+  X_listtest[[ii]] <- X[1:T,cols]
+  y_listtest[[ii]] <- Y[1:T,ii]
+  regdata_test[[ii]] <- list(y=Y[1:T,ii],X=X[1:T,cols])
+}
+# Make draws from sampler with necessary flags marked as FALSE
+samptestbeta <- SUR_Bayes.post(T,N,P,1000,X[1:T,],Y[1:T,],update_omega=FALSE)
+samptestomega <- SUR_Bayes.post(T,N,P,1000,X[1:T,],Y[1:T,],update_beta=FALSE)
+```
+
+# Generate plot of $\beta$ against its theoretical density curve
+```{r plotfsda}
+# Generate parameters required to calculate the multivariate normal distribution parameters
+omega_est <- matrix(samptestbeta$omega[[1]],ncol=P)
+M <- kronecker(solveV(omega_est),diag(T))
+X_test <- matrix(double(T*N*P*N),ncol=P*N)
+X_test[1:T,1:P] <- X_listtest[[1]]
+X_test[(T+1):(2*T),(P+1):(2*P)] <- X_listtest[[2]]
+betahat <- solveV(t(X_test)%*%M%*%X_test)%*%t(X_test)%*%M%*%matrix(c(y_listtest[[1]],y_listtest[[2]]))
+omegabar <- solveV(t(X_test)%*%M%*%X_test)
+# Plot histogram
+hist(samptestbeta$beta[,1],probability=TRUE)
+normsamp <- rnorm(10000,betahat[1],sqrt(omegabar[1,1]))
+lines(density(normsamp),col='red',lwd=2)
+```
+We see that the fit is reasonable, indicating that we can assume, with some confidence, that we are drawing from the correct posterior for $\beta$ terms.
+
+We test the Sigma draws using the fact that when we fix a vector $\mathbf{a}$, then $\frac{a\Sigma a}{a V  a}$ follows a $\chi^2$ distribution with $m$ degrees of freedom if $\Sigma$ follows a $Wishart(V,m)$ distribution. 
+```{r sdafsdfasdf}
+# Generate parameters required to calculate the inverse wishart distribution
+a <- rnorm(P)
+tests <- sapply(1:1000,function(x) t(a)%*%solveV(samptestomega$omega[[x]])%*%a)
+beta_est <- samptestomega$beta[1,]
+R_est <- sapply(1:N, function(x) 
+  sapply(1:N, function(y) 
+    t(y_listtest[[x]] - X_listtest[[x]]%*%beta_est[(1+(P*(x-1))):(x*P)])%*%(y_listtest[[y]] - X_listtest[[y]]%*%beta_est[(1+(P*(y-1))):(y*P)])))
+Nu <- 0.001*diag(N)
+wisharttest <- tests/((t(a)%*%solveV(Nu+ R_est)%*%a)[1])
+hist(wisharttest,probability = TRUE)
+chisqsamp <- rchisq(10000,T)
+lines(density(chisqsamp),col='red',lwd=2)
+```
+We see that the fit is reasonable, indicating that we can assume, with some confidence, that we are drawing from the correct posterior for $\Sigma$ terms.
+
+We now draw samples from our MCMC and the bayesm MCMC, and plot the histogram of the $\beta_1$ draws to see if they follow the same distribution. 
+```{r lmao}
+OurSamples <- SUR_Bayes.post(T,N,P,1000,X[1:T,],Y[1:T,])
+BayesmSamples <- rsurGibbs(list(regdata=regdata_test),Mcmc=list(R=1000))
+hist(OurSamples$beta[,1],probability=TRUE, xlab = expression(paste(beta,"1")),
+     main = expression(paste("Histogram of Our MCMC", beta, "1 Draws" )))
+
+```
+
+
+```{r lmfao}
+hist(BayesmSamples$betadraw[,1],probability=TRUE,xlab = expression(paste(beta,"1")),
+     main = expression(paste("Histogram of bayesm MCMC", beta, "1 Draws" )))
+```
+We see that the means are approximately equal, but there's a large discrepancy in variance. This is likely due to the default priors that are used by the bayesm package on the Inverse Wishart draws for $\Sigma$
